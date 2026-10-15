@@ -1,0 +1,238 @@
+# Сборка и публикация мультиархитектурного образа Codex (linux/amd64, linux/arm64)
+# в GitHub Container Registry (GHCR).
+# Единственный источник Dockerfile — docker/codex/Dockerfile, тот же, что и при локальной сборке.
+name: docker-codex
+
+on:
+  push:
+    branches:
+      - main
+    # Пересборка только при изменении самого образа или пайплайна:
+    # правки документации образ не затрагивают
+    paths:
+      - 'docker/codex/**'
+      - '.dockerignore'
+      - '.github/workflows/docker-codex.yml'
+  pull_request:
+    paths:
+      - 'docker/codex/**'
+      - '.dockerignore'
+      - '.github/workflows/docker-codex.yml'
+  # Ежедневная пересборка: новая версия Codex и обновления базового образа
+  # приходят из npm и apt, а не из коммитов, поэтому push-триггеры их не ловят.
+  # Время смещено от круглого часа: на нулевой минуте очередь раннеров GitHub перегружена
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+env:
+  DOCKERFILE: docker/codex/Dockerfile
+  PROJECT_DIR: /app
+  PLATFORMS: linux/amd64,linux/arm64
+  # UID/GID фиксированы: в опубликованном образе пользователь codex всегда 1000:1000.
+  # Для другого UID образ пересобирается локально: docker build --build-arg USER_ID=...
+  USER_ID: '1000'
+  GROUP_ID: '1000'
+
+# Параллельные запуски по одной ссылке отменяются: в реестр публикуется
+# результат последнего коммита, промежуточные сборки не нужны
+concurrency:
+  group: docker-codex-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Имя образа и версия CLI вычисляются один раз на весь запуск: проверка и
+  # публикация обязаны собрать и опубликовать одну и ту же версию Codex,
+  # иначе тег версии разойдётся с содержимым образа
+  resolve:
+    name: Имя образа и версия Codex
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    permissions:
+      contents: read
+
+    outputs:
+      image: ${{ steps.image.outputs.name }}
+      version: ${{ steps.cli.outputs.version }}
+
+    steps:
+      - name: Определить имя образа
+        id: image
+        # Путь GHCR допускает только строчные буквы, а владелец репозитория
+        # может содержать заглавные — имя приводится к нижнему регистру
+        run: |
+          printf 'name=%s\n' "$(printf '%s' "ghcr.io/${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Определить версию Codex
+        id: cli
+        # Версия берётся из npm до сборки: подстановка в build-arg делает
+        # содержимое образа воспроизводимым и инвалидирует слой кэша при
+        # выходе новой версии CLI
+        run: |
+          set -eu
+          version="$(npm view @openai/codex version)"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            printf 'Некорректная версия Codex из npm: %s\n' "$version" >&2
+            exit 1
+          fi
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+  # Каждая архитектура проверяется отдельным заданием: образ с несколькими
+  # платформами нельзя загрузить в локальный демон целиком, а параллельный
+  # запуск не даёт медленной сборке arm64 задерживать amd64
+  check:
+    name: Проверка образа (${{ matrix.platform }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: resolve
+
+    permissions:
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            # Слой кэша и проверочный тег адресуются именем без '/'
+            slug: amd64
+          - platform: linux/arm64
+            slug: arm64
+
+    steps:
+      - name: Получить исходники
+        uses: actions/checkout@v4
+
+      - name: Подготовить QEMU
+        # Раннеры GitHub — x86_64: сборка и запуск arm64 идут через эмуляцию
+        if: matrix.platform != 'linux/amd64'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Подготовить Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Собрать образ для проверки
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ env.DOCKERFILE }}
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            PROJECT_DIR=${{ env.PROJECT_DIR }}
+            USER_ID=${{ env.USER_ID }}
+            GROUP_ID=${{ env.GROUP_ID }}
+            CODEX_VERSION=${{ needs.resolve.outputs.version }}
+          load: true
+          tags: ${{ needs.resolve.outputs.image }}:ci-check-${{ matrix.slug }}
+          # Отдельный scope на архитектуру: общий кэш параллельные
+          # задания перезаписывали бы друг другом
+          cache-from: type=gha,scope=${{ matrix.slug }}
+          cache-to: type=gha,scope=${{ matrix.slug }},mode=max
+
+      - name: Проверить образ
+        # Инструменты окружения обязаны запускаться от пользователя codex,
+        # а лишних инструментов в образе быть не должно
+        env:
+          EXPECTED_VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -eux
+          image="${{ needs.resolve.outputs.image }}:ci-check-${{ matrix.slug }}"
+          platform="${{ matrix.platform }}"
+          run() { docker run --rm --platform "$platform" "$image" "$@"; }
+          run id
+          run id -un | grep -qx codex
+          run git --version
+          run ssh -V
+          run gh --version
+          # Окружение чистое: другого агента, OpenSpec и Python в образе нет
+          for tool in python3 openspec claude; do
+            if run sh -c "command -v $tool"; then
+              printf 'В образе найден лишний инструмент: %s\n' "$tool" >&2
+              exit 1
+            fi
+          done
+          # Тег публикации — версия CLI, поэтому расхождение установленной
+          # версии с ожидаемой останавливает пайплайн до попадания в реестр.
+          # Номер извлекается из вывода, а не берётся полем: перед ним
+          # может стоять имя программы
+          actual="$(run codex --version | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+[^[:space:]]*' | head -n 1)"
+          test "$actual" = "$EXPECTED_VERSION"
+
+  # Публикация выполняется только после успешной проверки обеих архитектур:
+  # непроверенный образ в GHCR не попадает, а на pull_request публикации нет
+  push:
+    name: Публикация образа в GHCR
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: [resolve, check]
+    if: github.event_name != 'pull_request'
+
+    permissions:
+      contents: read
+      # Запись в GHCR встроенным GITHUB_TOKEN, отдельные секреты не требуются
+      packages: write
+
+    steps:
+      - name: Получить исходники
+        uses: actions/checkout@v4
+
+      - name: Подготовить QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Подготовить Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Рассчитать теги и метки образа
+        id: meta
+        uses: docker/metadata-action@v5
+        # Версионирование образа повторяет версионирование Codex:
+        # собственной нумерации у образа нет, git-теги на теги образа не влияют
+        with:
+          images: ${{ needs.resolve.outputs.image }}
+          tags: |
+            type=raw,value=${{ needs.resolve.outputs.version }}
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.version=${{ needs.resolve.outputs.version }}
+
+      - name: Войти в GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Слои обеих архитектур берутся из кэша заданий проверки,
+      # поэтому шаг собирает манифест и публикует уже проверенный образ
+      - name: Опубликовать образ
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ env.DOCKERFILE }}
+          platforms: ${{ env.PLATFORMS }}
+          build-args: |
+            PROJECT_DIR=${{ env.PROJECT_DIR }}
+            USER_ID=${{ env.USER_ID }}
+            GROUP_ID=${{ env.GROUP_ID }}
+            CODEX_VERSION=${{ needs.resolve.outputs.version }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: |
+            type=gha,scope=amd64
+            type=gha,scope=arm64
+
+      - name: Показать результат публикации
+        run: |
+          {
+            printf '%s\n\n' '## Образ Codex опубликован'
+            printf '%s\n\n' "Версия Codex: \`${{ needs.resolve.outputs.version }}\`"
+            printf '%s\n\n' "Платформы: \`${{ env.PLATFORMS }}\`"
+            printf '%s\n\n' "Digest: \`${{ steps.push.outputs.digest }}\`"
+            printf '%s\n' 'Теги:'
+            printf '%s\n' '```text'
+            printf '%s\n' '${{ steps.meta.outputs.tags }}'
+            printf '%s\n' '```'
+          } >> "$GITHUB_STEP_SUMMARY"

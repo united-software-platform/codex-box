@@ -1,3 +1,11 @@
+*.log
+.DS_Store
+.idea/
+
+# Env
 .env
+
+# Ключи, авторизация gh и профили Codex — секреты окружения
 .ssh/
-.claude-accounts/
+.gh/
+.codex-accounts/
