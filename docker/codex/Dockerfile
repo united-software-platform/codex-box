@@ -12,11 +12,11 @@ WORKDIR ${PROJECT_DIR}
 # git, openssh-client и gh — работа с репозиторием и авторизацией.
 # procps даёт ps: Codex вызывает его при старте фонового app-server,
 # и без него запуск падает с «failed to invoke ps», а slim-образ ps не несёт.
-# wget нужен только для ключа репозитория gh и удаляется тем же слоем:
-# в образе остаются лишь инструменты окружения
+# wget, curl и python3 — инструменты агента: загрузка файлов, обращение
+# к HTTP API и скрипты; wget заодно получает ключ репозитория gh
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        git openssh-client ca-certificates procps wget \
+        git openssh-client ca-certificates procps wget curl python3 \
     && mkdir -p -m 755 /etc/apt/keyrings /etc/apt/sources.list.d \
     && wget -nv -O /etc/apt/keyrings/githubcli-archive-keyring.gpg \
         https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -25,7 +25,6 @@ RUN apt-get update \
         > /etc/apt/sources.list.d/github-cli.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends gh \
-    && apt-get purge -y --auto-remove wget \
     && rm -rf /var/lib/apt/lists/*
 
 RUN npm install -g "@openai/codex@${CODEX_VERSION}" \

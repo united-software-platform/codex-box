@@ -147,8 +147,11 @@ jobs:
           run gh --version
           # ps нужен Codex для фонового app-server: без него `codex` не стартует
           run ps -p 1
-          # Окружение чистое: другого агента, OpenSpec и Python в образе нет
-          for tool in python3 openspec claude; do
+          run wget --version
+          run curl --version
+          run python3 --version
+          # Окружение чистое: другого агента и OpenSpec в образе нет
+          for tool in openspec claude; do
             if run sh -c "command -v $tool"; then
               printf 'В образе найден лишний инструмент: %s\n' "$tool" >&2
               exit 1
