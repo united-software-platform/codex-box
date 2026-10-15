@@ -10,11 +10,13 @@ ARG CODEX_VERSION=latest
 WORKDIR ${PROJECT_DIR}
 
 # git, openssh-client и gh — работа с репозиторием и авторизацией.
+# procps даёт ps: Codex вызывает его при старте фонового app-server,
+# и без него запуск падает с «failed to invoke ps», а slim-образ ps не несёт.
 # wget нужен только для ключа репозитория gh и удаляется тем же слоем:
 # в образе остаются лишь инструменты окружения
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        git openssh-client ca-certificates wget \
+        git openssh-client ca-certificates procps wget \
     && mkdir -p -m 755 /etc/apt/keyrings /etc/apt/sources.list.d \
     && wget -nv -O /etc/apt/keyrings/githubcli-archive-keyring.gpg \
         https://cli.github.com/packages/githubcli-archive-keyring.gpg \

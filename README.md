@@ -178,7 +178,8 @@ gh auth login                                                # токен сох
 ## Состав образа
 
 Базовый образ `node:22-slim`, глобально установлен пакет `@openai/codex`. Дополнительно:
-`git`, `openssh-client`, `gh`, `ca-certificates`.
+`git`, `openssh-client`, `gh`, `ca-certificates`, `procps` — `ps` нужен Codex при старте
+фонового app-server.
 
 Другого агента, OpenSpec, Python и архиваторов в образе нет: пайплайн проверяет их отсутствие
 перед публикацией.

@@ -145,6 +145,8 @@ jobs:
           run git --version
           run ssh -V
           run gh --version
+          # ps нужен Codex для фонового app-server: без него `codex` не стартует
+          run ps -p 1
           # Окружение чистое: другого агента, OpenSpec и Python в образе нет
           for tool in python3 openspec claude; do
             if run sh -c "command -v $tool"; then
